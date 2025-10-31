@@ -1,7 +1,16 @@
-from typing import TypedDict, Optional, Dict, Any, List
+from typing import TypedDict, Optional, Dict, Any, List, Annotated
 from pathlib import Path
 import pandas as pd
 from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+
+
+def merge_statistics(existing: Optional[Dict[str, Dict[str, Any]]], new: Optional[Dict[str, Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    if existing is None:
+        existing = {}
+    if new is None:
+        return existing
+    return {**existing, **new}
 
 
 class EDState(TypedDict):
@@ -9,8 +18,18 @@ class EDState(TypedDict):
     df: Optional[pd.DataFrame]
     original_headers: Optional[List[str]]
     normalized_headers: Optional[Dict[str, str]]
-    statistics: Optional[Dict[str, Dict[str, Any]]]
+    statistics: Annotated[Optional[Dict[str, Dict[str, Any]]], merge_statistics]
     error: Optional[str]
+
+
+class ColumnAnalysisState(TypedDict):
+    file_path: str
+    df: Optional[pd.DataFrame]
+    original_headers: Optional[List[str]]
+    normalized_headers: Optional[Dict[str, str]]
+    statistics: Annotated[Optional[Dict[str, Dict[str, Any]]], merge_statistics]
+    error: Optional[str]
+    column_name: str
 
 
 def load_file(state: EDState) -> Dict[str, Any]:
@@ -67,47 +86,56 @@ def normalize_headers(state: EDState) -> Dict[str, Any]:
     return {"normalized_headers": normalized, "df": df}
 
 
-def compute_statistics(state: EDState) -> Dict[str, Any]:
+def fan_out_columns(state: EDState) -> List[Send]:
     if state.get("error"):
-        return {}
+        return []
     
     df = state["df"]
     if df is None:
-        return {"error": "No dataframe available"}
+        return []
     
-    stats = {}
+    return [
+        Send("analyze_column", {**state, "column_name": column})
+        for column in df.columns
+    ]
+
+
+def analyze_column(state: ColumnAnalysisState) -> Dict[str, Any]:
+    df = state["df"]
+    column = state["column_name"]
     
-    for column in df.columns:
-        col_stats = {
-            "dtype": str(df[column].dtype),
-            "count": int(df[column].count()),
-            "null_count": int(df[column].isnull().sum()),
-            "unique_count": int(df[column].nunique())
-        }
-        
-        if pd.api.types.is_numeric_dtype(df[column]):
+    col_stats = {
+        "dtype": str(df[column].dtype),
+        "count": int(df[column].count()),
+        "null_count": int(df[column].isnull().sum()),
+        "unique_count": int(df[column].nunique())
+    }
+    
+    if pd.api.types.is_numeric_dtype(df[column]):
+        col_stats.update({
+            "min": float(df[column].min()) if pd.notna(df[column].min()) else None,
+            "max": float(df[column].max()) if pd.notna(df[column].max()) else None,
+            "mean": float(df[column].mean()) if pd.notna(df[column].mean()) else None,
+            "median": float(df[column].median()) if pd.notna(df[column].median()) else None,
+            "std": float(df[column].std()) if pd.notna(df[column].std()) else None,
+            "q25": float(df[column].quantile(0.25)) if pd.notna(df[column].quantile(0.25)) else None,
+            "q75": float(df[column].quantile(0.75)) if pd.notna(df[column].quantile(0.75)) else None,
+        })
+    elif pd.api.types.is_string_dtype(df[column]) or pd.api.types.is_object_dtype(df[column]):
+        non_null_values = df[column].dropna()
+        if len(non_null_values) > 0:
             col_stats.update({
-                "min": float(df[column].min()) if pd.notna(df[column].min()) else None,
-                "max": float(df[column].max()) if pd.notna(df[column].max()) else None,
-                "mean": float(df[column].mean()) if pd.notna(df[column].mean()) else None,
-                "median": float(df[column].median()) if pd.notna(df[column].median()) else None,
-                "std": float(df[column].std()) if pd.notna(df[column].std()) else None,
-                "q25": float(df[column].quantile(0.25)) if pd.notna(df[column].quantile(0.25)) else None,
-                "q75": float(df[column].quantile(0.75)) if pd.notna(df[column].quantile(0.75)) else None,
+                "most_common": str(non_null_values.mode()[0]) if len(non_null_values.mode()) > 0 else None,
+                "min_length": int(non_null_values.astype(str).str.len().min()),
+                "max_length": int(non_null_values.astype(str).str.len().max()),
+                "avg_length": float(non_null_values.astype(str).str.len().mean()),
             })
-        elif pd.api.types.is_string_dtype(df[column]) or pd.api.types.is_object_dtype(df[column]):
-            non_null_values = df[column].dropna()
-            if len(non_null_values) > 0:
-                col_stats.update({
-                    "most_common": str(non_null_values.mode()[0]) if len(non_null_values.mode()) > 0 else None,
-                    "min_length": int(non_null_values.astype(str).str.len().min()),
-                    "max_length": int(non_null_values.astype(str).str.len().max()),
-                    "avg_length": float(non_null_values.astype(str).str.len().mean()),
-                })
-        
-        stats[column] = col_stats
     
-    return {"statistics": stats}
+    return {"statistics": {column: col_stats}}
+
+
+def aggregate_statistics(state: EDState) -> Dict[str, Any]:
+    return {}
 
 
 def create_eda_graph():
@@ -116,13 +144,15 @@ def create_eda_graph():
     builder.add_node("load_file", load_file)
     builder.add_node("identify_headers", identify_headers)
     builder.add_node("normalize_headers", normalize_headers)
-    builder.add_node("compute_statistics", compute_statistics)
+    builder.add_node("analyze_column", analyze_column)
+    builder.add_node("aggregate_statistics", aggregate_statistics)
     
     builder.add_edge(START, "load_file")
     builder.add_edge("load_file", "identify_headers")
     builder.add_edge("identify_headers", "normalize_headers")
-    builder.add_edge("normalize_headers", "compute_statistics")
-    builder.add_edge("compute_statistics", END)
+    builder.add_conditional_edges("normalize_headers", fan_out_columns, ["analyze_column"])
+    builder.add_edge("analyze_column", "aggregate_statistics")
+    builder.add_edge("aggregate_statistics", END)
     
     return builder.compile()
 
@@ -180,7 +210,8 @@ def main():
     print("  1. Load file (CSV or Excel)")
     print("  2. Identify headers")
     print("  3. Normalize headers")
-    print("  4. Compute statistics")
+    print("  4. Analyze each column in parallel ⚡")
+    print("  5. Aggregate statistics")
     
     file_path = input("\nEnter the path to your CSV or Excel file: ").strip()
     

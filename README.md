@@ -14,17 +14,30 @@ A LangGraph-powered data analysis pipeline that processes CSV and Excel files th
 
 ## Graph Architecture
 
-The application uses LangGraph to create a state-based processing pipeline:
+The application uses LangGraph to create a state-based processing pipeline with **parallel column analysis**:
 
 ```
-START → load_file → identify_headers → normalize_headers → compute_statistics → END
+START → load_file → identify_headers → normalize_headers → [fan-out]
+                                                               ↓
+                                    ┌──────────────────────────┼──────────────────────────┐
+                                    ↓                          ↓                          ↓
+                              analyze_column_1         analyze_column_2    ...    analyze_column_N
+                              (parallel execution)
+                                    ↓                          ↓                          ↓
+                                    └──────────────────────────┼──────────────────────────┘
+                                                               ↓
+                                                    aggregate_statistics → END
 ```
 
-Each node in the graph performs a specific task and updates the shared state, allowing for a clear, modular data processing workflow.
+### Key Features
+
+- **Dynamic Fan-Out**: Uses LangGraph's `Send` API to dynamically create parallel analysis nodes for each column
+- **Concurrent Processing**: All columns are analyzed simultaneously, significantly improving performance for wide datasets
+- **Automatic Aggregation**: Results from parallel nodes are automatically merged using a custom reducer function
 
 ### Graph Visualization
 
-When you run the application, it automatically generates a **Mermaid diagram** (`eda_graph.png`) that visually represents the graph structure, showing all nodes and edges. This makes it easy to understand the data flow at a glance.
+When you run the application, it automatically generates a **Mermaid diagram** (`eda_graph.png`) that visually represents the graph structure, showing all nodes and edges including the parallel execution pattern. This makes it easy to understand the data flow at a glance.
 
 ## Installation
 
@@ -156,9 +169,11 @@ class EDState(TypedDict):
     df: Optional[pd.DataFrame]                  # Loaded DataFrame
     original_headers: Optional[List[str]]       # Original column names
     normalized_headers: Optional[Dict[str, str]] # Original → Normalized mapping
-    statistics: Optional[Dict[str, Dict]]       # Column statistics
+    statistics: Annotated[Optional[Dict[str, Dict]], merge_statistics]  # Column statistics with reducer
     error: Optional[str]                        # Error message if any
 ```
+
+The `statistics` field uses an `Annotated` type with a custom `merge_statistics` reducer function. This allows multiple parallel nodes to write to the same state key, automatically merging their results into a single dictionary.
 
 ## Graph Nodes
 
@@ -175,8 +190,19 @@ Normalizes header names:
 - Removes special characters
 - Applies the normalized names to the DataFrame
 
-### 4. compute_statistics
-Calculates comprehensive statistics for each column based on data type.
+### 4. fan_out_columns (conditional edge)
+Creates dynamic `Send` objects for each column, dispatching parallel analysis tasks.
+
+### 5. analyze_column (parallel execution)
+Analyzes a single column:
+- For numeric columns: calculates min, max, mean, median, std, quantiles
+- For text columns: finds most common value and length statistics
+- For all columns: counts total, null, and unique values
+
+This node runs in parallel for all columns simultaneously.
+
+### 6. aggregate_statistics
+Collects and merges results from all parallel column analysis nodes using a custom reducer function.
 
 ## Extending the Graph
 
@@ -186,7 +212,7 @@ To add new nodes or modify the workflow:
 2. Add the node to the graph builder: `builder.add_node("node_name", node_function)`
 3. Add edges to connect it: `builder.add_edge("from_node", "to_node")`
 
-Example:
+### Example: Adding a Simple Node
 
 ```python
 def custom_analysis(state: EDState) -> Dict[str, Any]:
@@ -196,8 +222,31 @@ def custom_analysis(state: EDState) -> Dict[str, Any]:
 
 # Add to graph
 builder.add_node("custom_analysis", custom_analysis)
-builder.add_edge("compute_statistics", "custom_analysis")
+builder.add_edge("aggregate_statistics", "custom_analysis")
 builder.add_edge("custom_analysis", END)
+```
+
+### Example: Adding Parallel Processing
+
+If you need concurrent updates to the same state field, use `Annotated` with a reducer:
+
+```python
+from typing import Annotated
+
+def merge_results(existing: Optional[List], new: Optional[List]) -> List:
+    if existing is None:
+        existing = []
+    if new is None:
+        return existing
+    return existing + new
+
+class ExtendedState(TypedDict):
+    # ... other fields ...
+    results: Annotated[Optional[List], merge_results]
+
+def parallel_task(state: ExtendedState) -> Dict[str, Any]:
+    # Process and return partial result
+    return {"results": [some_result]}
 ```
 
 ## Error Handling
